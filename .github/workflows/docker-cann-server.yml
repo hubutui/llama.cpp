@@ -1,0 +1,149 @@
+name: Publish CANN server Docker images
+
+on:
+  workflow_dispatch:
+    inputs:
+      chip:
+        description: "CANN target to build"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - 910b
+          - 910c
+      push_image:
+        description: "Push image to GHCR"
+        required: true
+        default: true
+        type: boolean
+  push:
+    paths:
+      - ".github/workflows/docker-cann-server.yml"
+      - ".devops/llama-server-cann-910b.Dockerfile"
+      - ".devops/llama-server-cann-910c.Dockerfile"
+      - "tools/**"
+      - "common/**"
+      - "cmake/**"
+      - "ggml/**"
+      - "include/**"
+      - "src/**"
+      - "CMakeLists.txt"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.chip }} server image
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - chip: 910b
+            dockerfile: .devops/llama-server-cann-910b.Dockerfile
+            tag: server-cann-910b
+          - chip: 910c
+            dockerfile: .devops/llama-server-cann-910c.Dockerfile
+            tag: server-cann-910c
+
+    steps:
+      - name: Check selected target
+        id: selected
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" != "workflow_dispatch" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ inputs.chip }}" == "all" || "${{ inputs.chip }}" == "${{ matrix.chip }}" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the repo
+        if: ${{ steps.selected.outputs.enabled == 'true' }}
+        uses: actions/checkout@v6
+
+      - name: Free disk space
+        if: ${{ steps.selected.outputs.enabled == 'true' }}
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Set up QEMU
+        if: ${{ steps.selected.outputs.enabled == 'true' }}
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
+        with:
+          image: tonistiigi/binfmt:qemu-v10.2.1
+
+      - name: Set up Docker Buildx
+        if: ${{ steps.selected.outputs.enabled == 'true' }}
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Determine image metadata
+        if: ${{ steps.selected.outputs.enabled == 'true' }}
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          repo="${repo,,}"
+          image="ghcr.io/${owner}/${repo}"
+          short_sha="${GITHUB_SHA::12}"
+
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: ${{ steps.selected.outputs.enabled == 'true' && (github.event_name == 'push' || inputs.push_image == true) }}
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        if: ${{ steps.selected.outputs.enabled == 'true' }}
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: server
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          push: ${{ github.event_name == 'push' || inputs.push_image == true }}
+          provenance: false
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ matrix.tag }}
+            ${{ steps.meta.outputs.image }}:${{ matrix.tag }}-${{ steps.meta.outputs.short_sha }}
+          build-args: |
+            BUILD_DATE=${{ steps.meta.outputs.created }}
+            APP_VERSION=${{ github.ref_name }}
+            APP_REVISION=${{ github.sha }}
+            IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=llama.cpp
+            org.opencontainers.image.description=LLM inference in C/C++
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=cann-${{ matrix.chip }}
+          cache-to: type=gha,mode=max,scope=cann-${{ matrix.chip }}
